@@ -1,3 +1,4 @@
+#include <type_traits>
 #include <stdfloat>
 #include <cassert>
 #include <cstdint>
@@ -5,7 +6,9 @@
 #include <array>
 #include <bit>
 
-static constexpr int NUM_FPREGS		= 32;
+#ifndef TOO_ACCURATE
+# define TOO_ACCURATE 0
+#endif
 
 using std::uint32_t, std::uint64_t, std::float32_t, std::float64_t;
 
@@ -15,13 +18,6 @@ union widereg {
 	std::uint64_t wide;
 };
 
-union fpregpair {
-	std::float32_t sgl;
-	std::float64_t dbl;
-	std::uint32_t word;
-	std::uint64_t lng;
-};
-
 class r4300_core {
 public:
 	enum gpr : unsigned {
@@ -29,7 +25,6 @@ public:
 		  t0, t1, t2, t3, t4, t5, t6, t7,
 		  s0, s1, s2, s3, s4, s5, s6, s7,
 		  t8, t9, k0, k1, gp, sp, s8, ra,
-		NUM_GPREGS,
 	};
 
 	enum control : unsigned {
@@ -58,33 +53,32 @@ public:
 		TagLo		= 28,
 		TagHi		= 29,
 		ErrorEPC	= 30,
-		NUM_COP0REGS	= 32,
 	};
 
 protected:
-	widereg gpregs[NUM_GPREGS];
-	uint64_t cop0regs[NUM_COP0REGS];
-	fpregpair fpregs[NUM_FPREGS];
+	widereg gpregs[32];
+	uint64_t cop0regs[32];
+	std::byte fpregs[sizeof(float64_t)][32];
 	widereg pc;
 	uint64_t mult[2];
 	bool LLBit;
 
 public:
-	typedef void (r4300_core::*execute_opcode_t)(uint32_t opcode);
-
 	enum status : unsigned {
-		IE = 0, EXL, EXR, KSU, UX = 5, SX, KX, IM,
-		DS = 16, RE = 25, FR, RP, CU
+		IE = 0,		EXL = 1,	EXR = 2,	KSU = 3,
+		UX = 5,		SX = 6,		KX = 7,		IM = 8,
+		DS = 16,	RE = 25,	FR = 26,	RP = 27,
+		CU = 28,
 	};
 
-	static constexpr const char *const gpr_names[NUM_GPREGS] = {
+	static const char *const gpr_names[] = {
 		"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
 		  "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
 		  "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
 		  "t8", "t9", "k0", "k1", "gp", "sp", "s8", "ra",
 	};
 
-	static constexpr const char *const control_names[NUM_COP0REGS] = {
+	static const char *const control_names[] = {
 		"Index",	"Random",	"EntryLo0",	"EntryLo1",
 		"Context",	"PageMask",	"Wired",	"CP0R7",
 		"BadVAddr",	"Count",	"EntryHi",	"Compare",
@@ -117,35 +111,50 @@ public:
 		return gpregs[index].wide;
 	}
 
-	void write_fpr64(int index, float64_t value) {
+	template<typename T>
+	requires((std::is_integral<T> || std::is_floating_point<T>) &&
+		 (sizeof(T) == 4))
+	void write_fpr32(int index, T value) {
 		assert(index >= 0 && index < 32);
-#if 0 // funky
-		if(cop0regs[Status] & (1 << FR)) {
-			fpregs[index >> 1].reg[index & 1].value = value;
-		} else {
-			unsigned char repr[8];
-			memcpy(repr, &value, 8);
-			std::memcpy(fpregs[index >> 1].reg[0].lo, repr, 4);
-			std::memcpy(fpregs[index >> 1].reg[1].lo, repr + 4, 4);
-		}
-#endif
-		fpregs[index].dbl = value;
+		std::memcpy(fpregs[index], &value, 4);
 	}
 
-	float64_t read_fpr64(int index) {
+	template<typename T>
+	requires((std::is_integral<T> || std::is_floating_point<T>) &&
+		 (sizeof(T) == 4))
+	T read_fpr32(int index) {
 		assert(index >= 0 && index < 32);
-#if 0 // funky
-		if(cop0regs[Status] & (1 << FR)) {
-			return fpregs[index >> 1].reg[index & 1].value;
-		} else {
-			unsigned char repr[8];
-			std::memcpy(repr, fpregs[index >> 1].reg[0].lo, 4);
-			std::memcpy(repr + 4, fpregs[index >> 1].reg[1].lo, 4);
-			return std::bit_cast<float64_t>(repr);
-		}
-#endif
-		return fpregs[index].dbl;
+		return *reinterpret_cast<T *>(fpregs[index]);
 	}
 
-	execute_opcode_t decode(uint32_t opcode);
+	template<typename T>
+	requires((std::is_integral<T> || std::is_floating_point<T>) &&
+		 (sizeof(T) == 8))
+	void write_fpr64(int index, T value) {
+		assert(index >= 0 && index < 32);
+		if((cop0regs[Status] & (1 << FR)) || !TOO_ACCURATE) {
+			std::memcpy(fpregs[index], &value, 8);
+		} else {
+			std::byte *repr = reinterpret_cast<std::byte *>(&value);
+			std::memcpy(fpregs[index], repr, 4);
+			std::memcpy(fpregs[index + 1], repr + 4, 4);
+		}
+	}
+
+	template<typename T>
+	requires((std::is_integral<T> || std::is_floating_point<T>) &&
+		 (sizeof(T) == 8))
+	T read_fpr64(int index) {
+		assert(index >= 0 && index < 32);
+		if((cop0regs[Status] & (1 << FR)) || !TOO_ACCURATE) {
+			return *reinterpret_cast<T *>(fpregs[index]);
+		} else {
+			std::byte repr[8];
+			std::memcpy(repr, fpregs[index], 4);
+			std::memcpy(repr + 4, fpregs[index + 1], 4);
+			return *reinterpret_cast<T *>(repr);
+		}
+	}
+
+	void decode(uint32_t opcode);
 };
